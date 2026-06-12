@@ -1,9 +1,3 @@
-# =============================================================================
-# Workflow: Build Release APK
-# Purpose: Build an Android release APK from a zipped project source
-# Improvements: Caching, reliability, validation, logging, concurrency control
-# =============================================================================
-
 name: Build Release APK
 
 on:
@@ -11,370 +5,50 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
-# -----------------------------------------------------------------------------
-# IMPROVEMENT #13: Concurrency protection
-# Prevents multiple simultaneous runs on the same branch, cancelling older
-# in-progress runs when a new commit is pushed. Saves CI minutes and prevents
-# race conditions on artifact uploads.
-# -----------------------------------------------------------------------------
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-# -----------------------------------------------------------------------------
-# IMPROVEMENT #15: Explicit default permissions
-# Follows least-privilege principle. Only contents:read is needed for checkout.
-# Prevents accidental write access to repository resources.
-# -----------------------------------------------------------------------------
-permissions:
-  contents: read
-
-env:
-  # -----------------------------------------------------------------------------
-  # IMPROVEMENT #8: Centralized configuration via environment variables
-  # Change project settings in one place rather than hunting through steps.
-  # -----------------------------------------------------------------------------
-  ZIP_FILE: "123.zip"
-  PROJECT_DIR: "ads-maker-file"
-  ANDROID_API_LEVEL: "33"
-  BUILD_TOOLS_VERSION: "33.0.2"
-  JAVA_VERSION: "17"
-  JAVA_DISTRIBUTION: "temurin"
-  APK_OUTPUT_PATH: "ads-maker-file/app/build/outputs/apk/release"
-
 jobs:
   build:
-    name: Assemble Release APK
     runs-on: ubuntu-latest
 
-    # -------------------------------------------------------------------------
-    # IMPROVEMENT #12: Sensible timeout limit
-    # Prevents runaway builds from consuming CI minutes indefinitely.
-    # 30 minutes is generous for an Android release build.
-    # -------------------------------------------------------------------------
-    timeout-minutes: 30
-
     steps:
-      # -----------------------------------------------------------------------
-      # Step 1: Checkout repository
-      # -----------------------------------------------------------------------
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #6: Validate required files exist before proceeding
-      # Fails fast with a clear error message instead of a cryptic unzip error.
-      # -----------------------------------------------------------------------
-      - name: Validate required source files
+      - name: Unzip project
+        run: unzip 123.zip
+
+      - name: Fix gradlew (CRLF → Unix)
         run: |
-          echo "::group::Pre-flight validation checks"
+          sed -i 's/\r$//' ads-maker-file/gradlew
+          chmod +x ads-maker-file/gradlew
 
-          echo "→ Checking for required ZIP file: ${ZIP_FILE}"
-          if [[ ! -f "${ZIP_FILE}" ]]; then
-            echo "::error file=${ZIP_FILE}::Required ZIP file '${ZIP_FILE}' not found in repository root."
-            echo "  Available files in root:"
-            ls -lah .
-            exit 1
-          fi
-
-          echo "✓ ZIP file found: $(du -sh ${ZIP_FILE} | cut -f1) in size"
-          echo "::endgroup::"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #18: Improved ZIP extraction handling
-      # - Validates ZIP integrity before extracting (zip -T)
-      # - Uses explicit output directory to avoid unpredictable extraction paths
-      # - Verifies the expected project directory exists post-extraction
-      # - Lists top-level contents for troubleshooting visibility
-      # -----------------------------------------------------------------------
-      - name: Extract and validate project ZIP
-        run: |
-          echo "::group::ZIP extraction"
-
-          echo "→ Testing ZIP integrity..."
-          if ! zip -T "${ZIP_FILE}"; then
-            echo "::error::ZIP file '${ZIP_FILE}' failed integrity check. File may be corrupt."
-            exit 1
-          fi
-          echo "✓ ZIP integrity check passed"
-
-          echo "→ Extracting ZIP contents..."
-          # -o: overwrite without prompting, -q: quiet mode (reduces log noise)
-          unzip -oq "${ZIP_FILE}"
-
-          echo "→ Verifying expected project directory exists post-extraction..."
-          if [[ ! -d "${PROJECT_DIR}" ]]; then
-            echo "::error::Expected project directory '${PROJECT_DIR}' not found after extraction."
-            echo "  Directories found after extraction:"
-            find . -maxdepth 2 -type d | sort
-            exit 1
-          fi
-
-          echo "✓ Project directory confirmed: ${PROJECT_DIR}"
-          echo "→ Top-level project contents:"
-          ls -lah "${PROJECT_DIR}/"
-          echo "::endgroup::"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #6 + #16: Validate Gradle wrapper and project structure
-      # Ensures gradlew and build.gradle exist before setting up Java/SDK,
-      # avoiding wasted setup time on a fundamentally broken project layout.
-      # -----------------------------------------------------------------------
-      - name: Validate project structure
-        run: |
-          echo "::group::Project structure validation"
-
-          REQUIRED_FILES=(
-            "${PROJECT_DIR}/gradlew"
-            "${PROJECT_DIR}/build.gradle"
-          )
-
-          # Also accept Kotlin DSL build script
-          GRADLE_KTS="${PROJECT_DIR}/build.gradle.kts"
-          if [[ ! -f "${PROJECT_DIR}/build.gradle" && -f "${GRADLE_KTS}" ]]; then
-            REQUIRED_FILES[1]="${GRADLE_KTS}"
-          fi
-
-          ALL_OK=true
-          for file in "${REQUIRED_FILES[@]}"; do
-            if [[ ! -f "${file}" ]]; then
-              echo "::error::Required project file missing: ${file}"
-              ALL_OK=false
-            else
-              echo "✓ Found: ${file}"
-            fi
-          done
-
-          if [[ "${ALL_OK}" == "false" ]]; then
-            echo ""
-            echo "Project directory tree (depth 3):"
-            find "${PROJECT_DIR}" -maxdepth 3 | sort
-            exit 1
-          fi
-
-          echo "✓ Project structure looks valid"
-          echo "::endgroup::"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #4 + #17: Fix line endings AND permissions atomically
-      # Combining into one step reduces overhead. sed handles CRLF from Windows
-      # zipped projects. chmod is idempotent and always safe to run.
-      # -----------------------------------------------------------------------
-      - name: Fix Gradle wrapper line endings and permissions
-        run: |
-          echo "→ Normalizing gradlew line endings (CRLF → LF)..."
-          sed -i 's/\r$//' "${PROJECT_DIR}/gradlew"
-
-          echo "→ Setting gradlew executable permission..."
-          chmod +x "${PROJECT_DIR}/gradlew"
-
-          echo "✓ gradlew is ready"
-          # Show file info for audit trail
-          file "${PROJECT_DIR}/gradlew"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #2: Java setup with built-in Gradle caching
-      # actions/setup-java@v4 supports cache: 'gradle' natively, which caches
-      # ~/.gradle/caches and ~/.gradle/wrapper automatically.
-      # This alone can save 2-5 minutes on repeated builds.
-      # -----------------------------------------------------------------------
-      - name: Set up Java ${{ env.JAVA_VERSION }}
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: ${{ env.JAVA_DISTRIBUTION }}
-          java-version: ${{ env.JAVA_VERSION }}
-          # Built-in Gradle dependency + wrapper caching
-          cache: gradle
+          distribution: temurin
+          java-version: 17
 
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #3: Android SDK caching
-      # Caches the installed SDK components to avoid re-downloading on every run.
-      # The cache key includes the API level and build tools version so it
-      # invalidates correctly when you upgrade SDK components.
-      # -----------------------------------------------------------------------
-      - name: Cache Android SDK components
-        uses: actions/cache@v4
-        id: android-sdk-cache
-        with:
-          path: |
-            ${{ env.ANDROID_HOME }}/platforms/android-${{ env.ANDROID_API_LEVEL }}
-            ${{ env.ANDROID_HOME }}/build-tools/${{ env.BUILD_TOOLS_VERSION }}
-            ${{ env.ANDROID_HOME }}/platform-tools
-          key: android-sdk-api${{ env.ANDROID_API_LEVEL }}-bt${{ env.BUILD_TOOLS_VERSION }}-v1
-          restore-keys: |
-            android-sdk-api${{ env.ANDROID_API_LEVEL }}-bt${{ env.BUILD_TOOLS_VERSION }}-
-
-      # -----------------------------------------------------------------------
-      # Android SDK base setup
-      # -----------------------------------------------------------------------
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #4: Consolidated SDK installation with reliable license acceptance
-      # - Accepts licenses non-interactively via printf (more reliable than `yes`)
-      # - Only installs components if not already restored from cache
-      # - Groups license acceptance and component install to reduce round-trips
-      # -----------------------------------------------------------------------
-      - name: Accept Android SDK licenses and install components
+      - name: Accept licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install SDK components
         run: |
-          echo "::group::Android SDK setup"
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
 
-          echo "→ Accepting Android SDK licenses..."
-          # printf is more reliable than `yes` for non-interactive license acceptance
-          printf 'y\n%.0s' {1..10} | sdkmanager --licenses > /dev/null 2>&1 || true
-          echo "✓ Licenses accepted"
-
-          if [[ "${{ steps.android-sdk-cache.outputs.cache-hit }}" == "true" ]]; then
-            echo "✓ SDK components restored from cache — skipping installation"
-          else
-            echo "→ Installing SDK components (API ${{ env.ANDROID_API_LEVEL }}, build-tools ${{ env.BUILD_TOOLS_VERSION }})..."
-            sdkmanager \
-              "platform-tools" \
-              "platforms;android-${{ env.ANDROID_API_LEVEL }}" \
-              "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
-            echo "✓ SDK components installed"
-          fi
-
-          echo "→ Installed SDK packages:"
-          sdkmanager --list_installed 2>/dev/null || sdkmanager --list 2>/dev/null | grep -A1 "Installed"
-          echo "::endgroup::"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #1 + #11: Optimized Gradle build with enhanced logging
-      # - GRADLE_OPTS: increases heap to reduce GC pauses
-      # - --no-daemon: appropriate for CI (ephemeral runners, no benefit to daemon)
-      # - --parallel: enables parallel project compilation where possible
-      # - --build-cache: enables Gradle's local build cache
-      # - --stacktrace: provides full stack traces on failure for easier debugging
-      # - --info: provides meaningful progress without being overly verbose
-      # -----------------------------------------------------------------------
       - name: Build Release APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        env:
-          # Increase Gradle JVM heap for large Android projects
-          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
         run: |
-          echo "::group::Gradle build"
-          echo "→ Starting assembleRelease..."
-          echo "  Java version: $(java -version 2>&1 | head -1)"
-          echo "  Gradle wrapper version:"
-          ./gradlew --version
+          cd ads-maker-file
+          ./gradlew assembleRelease
 
-          ./gradlew assembleRelease \
-            --no-daemon \
-            --parallel \
-            --build-cache \
-            --stacktrace \
-            --info 2>&1 | tee ../gradle-build.log
-
-          BUILD_EXIT_CODE=${PIPESTATUS[0]}
-          echo "::endgroup::"
-
-          if [[ ${BUILD_EXIT_CODE} -ne 0 ]]; then
-            echo "::error::Gradle build failed with exit code ${BUILD_EXIT_CODE}"
-            echo "→ Last 50 lines of build log:"
-            tail -50 ../gradle-build.log
-            exit ${BUILD_EXIT_CODE}
-          fi
-
-          echo "✓ Build completed successfully"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #7 + #19: APK discovery and safeguard against missing outputs
-      # Validates that at least one APK was produced before attempting upload.
-      # Provides detailed output to aid troubleshooting if APK is missing.
-      # -----------------------------------------------------------------------
-      - name: Discover and validate APK output
-        id: apk-discovery
+      - name: Find APK
         run: |
-          echo "::group::APK discovery"
+          find ads-maker-file -name "*.apk"
 
-          echo "→ Searching for APK files in output directory..."
-          APK_COUNT=$(find "${APK_OUTPUT_PATH}" -name "*.apk" 2>/dev/null | wc -l)
-
-          if [[ ${APK_COUNT} -eq 0 ]]; then
-            echo "::error::No APK files found in expected output path: ${APK_OUTPUT_PATH}"
-            echo ""
-            echo "→ Full APK search across project directory:"
-            find "${PROJECT_DIR}" -name "*.apk" 2>/dev/null || echo "  No APKs found anywhere in ${PROJECT_DIR}"
-            echo ""
-            echo "→ Build outputs directory tree:"
-            find "${PROJECT_DIR}/app/build/outputs" -maxdepth 4 2>/dev/null | sort || echo "  outputs/ directory not found"
-            exit 1
-          fi
-
-          echo "✓ Found ${APK_COUNT} APK file(s):"
-          find "${APK_OUTPUT_PATH}" -name "*.apk" -exec ls -lah {} \;
-
-          # Export APK list for summary step
-          APK_LIST=$(find "${APK_OUTPUT_PATH}" -name "*.apk" | tr '\n' ' ')
-          echo "apk_list=${APK_LIST}" >> "${GITHUB_OUTPUT}"
-          echo "apk_count=${APK_COUNT}" >> "${GITHUB_OUTPUT}"
-          echo "::endgroup::"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #7: Upload artifact with explicit settings
-      # - retention-days: explicitly set (default is repo setting, often 90 days)
-      # - if-no-files-found: error ensures the step fails if path glob matches nothing
-      # - compression-level: 6 is a good balance of speed vs size for APKs
-      # -----------------------------------------------------------------------
-      - name: Upload Release APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk-${{ github.sha }}
-          path: ${{ env.APK_OUTPUT_PATH }}/**/*.apk
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 6
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #11 + #14: Build summary
-      # Writes a Markdown summary to the GitHub Actions job summary page,
-      # giving engineers a quick overview without digging through logs.
-      # -----------------------------------------------------------------------
-      - name: Write build summary
-        if: always()
-        run: |
-          APK_COUNT="${{ steps.apk-discovery.outputs.apk_count || '0' }}"
-
-          {
-            echo "## 🤖 Android Build Summary"
-            echo ""
-            echo "| Property | Value |"
-            echo "|---|---|"
-            echo "| **Workflow** | \`${{ github.workflow }}\` |"
-            echo "| **Branch** | \`${{ github.ref_name }}\` |"
-            echo "| **Commit** | \`${{ github.sha }}\` |"
-            echo "| **Triggered by** | \`${{ github.event_name }}\` |"
-            echo "| **Runner OS** | \`${{ runner.os }}\` |"
-            echo "| **Java Version** | \`${{ env.JAVA_VERSION }} (${{ env.JAVA_DISTRIBUTION }})\` |"
-            echo "| **Android API** | \`${{ env.ANDROID_API_LEVEL }}\` |"
-            echo "| **Build Tools** | \`${{ env.BUILD_TOOLS_VERSION }}\` |"
-            echo "| **APKs Produced** | \`${APK_COUNT}\` |"
-            echo "| **Artifact Name** | \`app-release-apk-${{ github.sha }}\` |"
-            echo ""
-
-            if [[ "${APK_COUNT}" -gt 0 ]]; then
-              echo "### ✅ APK Files"
-              echo "\`\`\`"
-              find "${APK_OUTPUT_PATH}" -name "*.apk" -exec ls -lah {} \; 2>/dev/null || echo "APK details unavailable"
-              echo "\`\`\`"
-            else
-              echo "### ❌ No APKs were produced"
-              echo "Check the build logs for errors."
-            fi
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-      # -----------------------------------------------------------------------
-      # IMPROVEMENT #4: Upload build log on failure for post-mortem debugging
-      # Only runs if the build step fails — keeps successful run artifacts clean.
-      # -----------------------------------------------------------------------
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gradle-build-log-${{ github.sha }}
-          path: gradle-build.log
-          if-no-files-found: ignore
-          retention-days: 7
+          name: app-release-apk
+          path: |
+            ads-maker-file/app/build/outputs/apk/release/**/*.apk
